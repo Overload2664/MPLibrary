@@ -62,9 +62,19 @@ namespace MPLibrary.GCN
             int index = 0;
             foreach (var tex in hsfFile.Textures)
             {
-                var rgba = gctex.Decode(tex.ImageData,
-                     tex.TextureInfo.Width, tex.TextureInfo.Height,
-                    (uint)tex.GcnFormat, tex.GetPaletteBytes(), (uint)tex.GcnPaletteFormat);
+                //Use the fully managed decoder. The native gctex_v13 library
+                //backing gctex.Decode is not shipped (notably on Linux) and
+                //throws DllNotFoundException, aborting the whole export.
+                var rgba = Decode_Gamecube.DecodeData(tex.ImageData,
+                    tex.PaletteData,
+                    tex.TextureInfo.Width, tex.TextureInfo.Height,
+                    tex.GcnFormat, tex.GcnPaletteFormat);
+
+                if (rgba == null || rgba.Length != tex.TextureInfo.Width * tex.TextureInfo.Height * 4)
+                    continue;
+
+                //Managed decoder outputs BGRA byte order; ImageSharp expects RGBA.
+                BitmapExtension.ConvertBgraToRgba(rgba);
 
                 var image = Image.LoadPixelData<Rgba32>(rgba, (int)tex.TextureInfo.Width, (int)tex.TextureInfo.Height);
 
@@ -864,18 +874,47 @@ namespace MPLibrary.GCN
         {
             List<IndexedPrimitive> primlist = new List<IndexedPrimitive>();
 
-            //Prepare a primitive of tri strips or tri fans if toggled
-            rsmeshopt.StripifyAlgo stripAlgo = rsmeshopt.StripifyAlgo.NvTriStripPort;
-            List<uint> tr_indices = CreatePrimitiveIndices(mesh, group,
-                settings.UseTriStrips && group.Indicies.Count > 6 ? GX.Command.DRAW_TRIANGLE_STRIP : GX.Command.DRAW_TRIANGLES,
-                stripAlgo);
+            //Stripification via rsmeshopt requires the native rsmeshopt library,
+            //which is not shipped (notably on Linux). Fall back to plain
+            //triangles when the native call is unavailable. Strips are only
+            //an optimization; triangles are always correct.
+            bool useStrips = settings.UseTriStrips && group.Indicies.Count > 6;
+            List<uint> tr_indices = null;
+            GX.Command actualType = GX.Command.DRAW_TRIANGLES;
+
+            if (useStrips)
+            {
+                try
+                {
+                    //Prepare a primitive of tri strips or tri fans if toggled
+                    rsmeshopt.StripifyAlgo stripAlgo = rsmeshopt.StripifyAlgo.NvTriStripPort;
+                    tr_indices = CreatePrimitiveIndices(mesh, group,
+                        GX.Command.DRAW_TRIANGLE_STRIP,
+                        stripAlgo);
+                    actualType = GX.Command.DRAW_TRIANGLE_STRIP;
+                }
+                catch (Exception ex) when (ex is DllNotFoundException ||
+                                           ex is EntryPointNotFoundException ||
+                                           ex is BadImageFormatException)
+                {
+                    useStrips = false;
+                }
+            }
+
+            if (!useStrips)
+            {
+                tr_indices = new List<uint>();
+                for (int i = 0; i < group.Indicies.Count; i++)
+                    tr_indices.Add((uint)group.Indicies[i]);
+                actualType = GX.Command.DRAW_TRIANGLES;
+            }
 
             IndexedPrimitive indexed_prim = new IndexedPrimitive();
-            indexed_prim.Type = settings.UseTriStrips ? GX.Command.DRAW_TRIANGLE_STRIP : GX.Command.DRAW_TRIANGLES;
+            indexed_prim.Type = actualType;
             primlist.Add(indexed_prim);
             indexed_prim.DrawMatrixIndices[0] = 0;
 
-            if (settings.UseTriStrips)
+            if (useStrips)
             {
                 for (int i = 0; i < tr_indices.Count; i++)
                 {
@@ -883,6 +922,7 @@ namespace MPLibrary.GCN
                     if (tr_indices[i] == uint.MaxValue)
                     {
                         indexed_prim = new IndexedPrimitive();
+                        indexed_prim.Type = actualType;
                         primlist.Add(indexed_prim);
                     }
                     else
@@ -899,6 +939,7 @@ namespace MPLibrary.GCN
                     int index = i * 3;
 
                     indexed_prim = new IndexedPrimitive();
+                    indexed_prim.Type = actualType;
                     primlist.Add(indexed_prim);
 
                     indexed_prim.Indices = new uint[3].ToList();

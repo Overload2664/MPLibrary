@@ -31,6 +31,12 @@ namespace PartyStudio.GCN
         List<SceneNode> DrawListOPA = new List<SceneNode>();
         List<SceneNode> DrawListXLU = new List<SceneNode>();
 
+        //Maps each rendered mesh to the HSF node it was created from.
+        //The viewport gizmo edits SceneNode.Transform, while rendering uses
+        //HSFObject.LocalMatrix, so the two must be kept in sync (see below).
+        Dictionary<SceneNode, HSFObject> SceneNodeMap = new Dictionary<SceneNode, HSFObject>();
+        private bool SyncingTransforms = false;
+
         Matrix4[] BoneViewMatrixArray = new Matrix4[0];
         Matrix4[] BoneWorldMatrixArray = new Matrix4[0];
         Matrix4[] BoneWorldInverseMatrixArray = new Matrix4[0];
@@ -113,10 +119,7 @@ namespace PartyStudio.GCN
 
         public void AddTexture(HSFTexture tex)
         {
-            var info = tex.TextureInfo;
-
-            tex.RenderTexture = new GLGXTexture(
-               tex.Name, info.Width, info.Height, (uint)tex.GcnFormat, (uint)tex.GcnPaletteFormat, 1, tex.ImageData, tex.PaletteData);
+            tex.RenderTexture = HsfTextureHelper.CreateTexture(tex);
             TextureCache.Add(tex.RenderTexture);
         }
 
@@ -191,13 +194,11 @@ namespace PartyStudio.GCN
             TextureCache.Clear();
             DrawListOPA.Clear();
             DrawListXLU.Clear();
+            SceneNodeMap.Clear();
 
             foreach (var tex in hsfFile.Textures)
             {
-                var info = tex.TextureInfo;
-
-                tex.RenderTexture = new GLGXTexture(
-                    tex.Name, info.Width, info.Height, (uint)tex.GcnFormat, (uint)tex.GcnPaletteFormat, 1, tex.ImageData, tex.PaletteData);
+                tex.RenderTexture = HsfTextureHelper.CreateTexture(tex);
                 TextureCache.Add(tex.RenderTexture);
             }
 
@@ -245,6 +246,13 @@ namespace PartyStudio.GCN
                             OnSceneSelected(node, n);
                         };
 
+                        //The gizmo transforms SceneNode.Transform, but rendering
+                        //uses HSFObject.LocalMatrix. Init the gizmo transform from
+                        //the node and write gizmo edits back into the node data.
+                        SceneNodeMap[sceneNode] = node;
+                        SyncSceneNodeTransform(sceneNode, node);
+                        sceneNode.Transform.TransformUpdated += (s, e) => OnSceneNodeTransformed(sceneNode);
+
                         HsfFile.ObjectNodes[index].Meshes.Add(sceneNode);
 
                         if (isOpaquePass)
@@ -283,6 +291,62 @@ namespace PartyStudio.GCN
         private void OnSceneSelected(HSFObject objNode, SceneNode node)
         {
             OnMeshSelected?.Invoke(objNode, node);
+        }
+
+        /// <summary>
+        /// Updates the gizmo transform of a mesh from the current HSF node data.
+        /// </summary>
+        private void SyncSceneNodeTransform(SceneNode sceneNode, HSFObject node)
+        {
+            var world = GetWorldMatrix(node);
+
+            SyncingTransforms = true;
+            sceneNode.Transform.Position = world.ExtractTranslation();
+            sceneNode.Transform.Rotation = world.ExtractRotation();
+            sceneNode.Transform.Scale = world.ExtractScale();
+            sceneNode.Transform.UpdateMatrix(true);
+            SyncingTransforms = false;
+        }
+
+        /// <summary>
+        /// Writes a gizmo transform edit back into the HSF node data so the
+        /// model follows the arrows and the edit is kept on save.
+        /// </summary>
+        private void OnSceneNodeTransformed(SceneNode sceneNode)
+        {
+            if (SyncingTransforms)
+                return;
+            if (!SceneNodeMap.TryGetValue(sceneNode, out var node))
+                return;
+
+            //Gizmo edits are in world space. Convert back to node local space.
+            var parentWorld = Matrix4.Identity;
+            if (node.Parent != null)
+                parentWorld = GetWorldMatrix(node.Parent);
+
+            var local = sceneNode.Transform.TransformMatrix * parentWorld.Inverted();
+            var pos = local.ExtractTranslation();
+            var rot = STMath.ToEulerAngles(local.ExtractRotation()) * STMath.Rad2Deg;
+            var sca = local.ExtractScale();
+
+            node.Data.BaseTransform.Translate = new Vector3XYZ(pos.X, pos.Y, pos.Z);
+            node.Data.BaseTransform.Rotate = new Vector3XYZ(rot.X, rot.Y, rot.Z);
+            node.Data.BaseTransform.Scale = new Vector3XYZ(sca.X, sca.Y, sca.Z);
+            node.UpdateMatrix();
+
+            //Refresh all gizmo transforms so sibling meshes and children follow.
+            SyncingTransforms = true;
+            foreach (var pair in SceneNodeMap)
+            {
+                var world = GetWorldMatrix(pair.Value);
+                pair.Key.Transform.Position = world.ExtractTranslation();
+                pair.Key.Transform.Rotation = world.ExtractRotation();
+                pair.Key.Transform.Scale = world.ExtractScale();
+                pair.Key.Transform.UpdateMatrix(true);
+            }
+            SyncingTransforms = false;
+
+            GLContext.ActiveContext.UpdateViewport = true;
         }
 
         public void DrawColorPicking(GLContext context)
@@ -437,7 +501,7 @@ namespace PartyStudio.GCN
                 if (node.Data.ParentIndex < -1 || node.Data.ParentIndex > HsfFile.ObjectNodes.Count)
                     continue;
 
-                BoneWorldMatrixArray[i] = GetWorldMatrix(node);
+                BoneWorldMatrixArray[i] = GetWorldMatrix(node) * modelMatrix;
 
                 BoneWorldInverseMatrixArray[i] = node.InvertedBindPose * BoneWorldMatrixArray[i];
 
@@ -480,12 +544,16 @@ namespace PartyStudio.GCN
             for (int i = 0; i < HsfFile.ObjectNodes.Count; i++)
             {
                 var nodeWorldMatrix = this.BoneWorldMatrixArray[i];
-                /*    if (HsfFile.ObjectNodes[i].Envelopes.Any(x => x.VertexCount > 0))
-                        BoneViewMatrixArray[i] = camera.ViewMatrix;
-                    else
-                        BoneViewMatrixArray[i] = nodeWorldMatrix * camera.ViewMatrix;
-                    */
-                BoneViewMatrixArray[i] = camera.ViewMatrix;
+                //The shader combines these with the projection matrix, so nodes
+                //need their world transform composed with the view matrix here.
+                //Using the view matrix alone would ignore node transforms
+                //(gizmo edits would move the arrows but not the model).
+                //Skinned meshes are transformed on the CPU beforehand, so those
+                //only need the view matrix.
+                if (HsfFile.ObjectNodes[i].Envelopes.Any(x => x.VertexCount > 0))
+                    BoneViewMatrixArray[i] = camera.ViewMatrix;
+                else
+                    BoneViewMatrixArray[i] = nodeWorldMatrix * camera.ViewMatrix;
 
                 //Billboarding
                 if ((HsfFile.ObjectNodes[i].Data.RenderFlags & HsfGlobals.BILLBOARD) != 0)
